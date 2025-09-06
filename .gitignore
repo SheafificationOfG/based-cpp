@@ -1,0 +1,9 @@
+# Object files
+*.o
+
+# Binaries
+*.out
+*.exe
+
+# Vim
+*.swp

@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+GIL standard linking script.
+
+This abstract system emulator driver is responsible for linking
+C++ program output stream with the terminal console output.
+"""
+
+from dataclasses import dataclass
+import io
+import os
+import shutil
+import subprocess
+import sys
+import typing as T
+
+
+def is_obj_file(arg: str):
+    return arg.endswith(".o") and os.path.isfile(arg)
+
+
+@dataclass(frozen=True)
+class Config:
+
+    out: str
+    files: tuple[str, ...]
+    cxxfilt: str | None
+    verbose: bool
+    print_bytes: bool
+    run: bytes
+
+    @classmethod
+    def from_args(cls, argv: list[str]):
+        argi = iter(argv)
+
+        out = "a.out"
+        files = list[str]()
+        verbose = False
+        print_bytes = False
+        run = None
+
+        while arg := next(argi, None):
+            match arg:
+                case "--verbose":
+                    verbose = True
+                case "--print-bytes":
+                    print_bytes = True
+                case "-o" | "--output":
+                    out = next(argi, out)
+                case output if output.startswith("--output="):
+                    out = arg.split("=", 1)[-1] or next(argi, out)
+                case "-r" | "--run":
+                    run = next(argi, run)
+                case symbol if symbol.startswith("--run="):
+                    run = arg.split("=", 1)[-1] or next(argi, run)
+                case file if os.path.isfile(file):
+                    files.append(file)
+                case _:
+                    pass
+
+        if out == "-":
+            out = "/dev/stdout"
+
+        cxxfilt = (
+            os.environ.get("CXXFILT")
+            or shutil.which("cxxfilt")
+            or shutil.which("c++filt")
+            if verbose
+            else None
+        )
+
+        if run is None:
+            run = os.environ.get("CXXRUN", "run")
+
+        return cls(out, tuple(files), cxxfilt, verbose, print_bytes, run.encode())
+
+    def log(self, *args, **kwargs):
+        if self.verbose:
+            print(*args, **kwargs)
+
+
+class InvalidObjFile(Exception): ...
+
+
+@dataclass(frozen=True)
+class Named[T]:
+    entry: T
+    name: bytes
+
+    def __str__(self):
+        return repr("".join(map(chr, self.name)))[1:-1]
+
+
+type Table[T] = tuple[Named[T], ...]
+
+
+class ELF:
+
+    @staticmethod
+    def expect(cond: bool):
+        if not cond:
+            raise InvalidObjFile
+
+    class Cursor:
+        def __init__(self, bin: T.IO[bytes]):
+            self.__bin = bin
+            self.addrsize: T.Literal[4, 8] | None = None
+            self.byteorder: T.Literal["big", "little"] | None = None
+
+        def seek(self, pos: int):
+            return self.__bin.seek(pos)
+
+        def read(self, nbytes: int) -> bytes:
+            b = self.__bin.read(nbytes)
+            if len(b) != nbytes:
+                raise InvalidObjFile
+            return b
+
+        def readwhile(self, cond: T.Callable[[bytes], bool]):
+            b = b""
+            while cond(n := self.read(1)):
+                b += n
+            return b
+
+        def readstr(self):
+            return self.readwhile(lambda b: b != b"\x00")
+
+        def readint(self, nbytes: int) -> int:
+            assert self.byteorder is not None
+            return int.from_bytes(self.read(nbytes), self.byteorder)
+
+        def readhalfword(self) -> int:
+            return self.readint(2)
+
+        def readword(self) -> int:
+            return self.readint(4)
+
+        def readoffset(self) -> int:
+            assert self.addrsize is not None
+            return self.readint(self.addrsize)
+
+        def select[R](self, nbytes: int, opts: dict[bytes, R]) -> R:
+            res = opts.get(self.read(nbytes), InvalidObjFile())
+            if isinstance(res, InvalidObjFile):
+                raise InvalidObjFile
+            return res
+
+    @dataclass(frozen=True)
+    class Header:
+        shoffset: int
+        shentsize: int
+        shnum: int
+        strtabidx: int
+
+        @classmethod
+        def read(cls, cursor: "ELF.Cursor"):
+
+            cursor.seek(0)
+            ELF.expect(cursor.read(4) == b"\x7fELF")  # magic
+            cursor.addrsize = cursor.select(1, {b"\x01": 4, b"\x02": 8})
+            cursor.byteorder = cursor.select(1, {b"\x01": "little", b"\x02": "big"})
+            ELF.expect(cursor.read(1) == b"\x01")  # version
+
+            # skip to header
+            cursor.seek(16)
+
+            ELF.expect(cursor.readhalfword() == 0x01)  # type == ET_REL
+            cursor.readhalfword()  # machine
+            ELF.expect(cursor.readword() == 1)  # version
+            cursor.readoffset()  # entrypoint
+            cursor.readoffset()  # PH offset
+            shoffset = cursor.readoffset()  # SH offset
+            cursor.readword()  # flags
+            cursor.readhalfword()  # elf header size
+            cursor.readhalfword()  # PH entry size
+            cursor.readhalfword()  # PH entry count
+            shentsize = cursor.readhalfword()  # SH entry size
+            shnum = cursor.readhalfword()  # SH entry count
+            strtaboff = cursor.readhalfword()  # SH string table index
+
+            return cls(shoffset, shentsize, shnum, strtaboff)
+
+        def section_headers(self, cursor: "ELF.Cursor"):
+            cursor.seek(self.shoffset)
+            section_headers = tuple(
+                ELF.SectionHeader.read(cursor) for _ in range(self.shnum)
+            )
+            shstrtab = section_headers[self.strtabidx]
+
+            def named(sh: ELF.SectionHeader):
+                cursor.seek(shstrtab.offset + sh.name)
+                return Named(sh, cursor.readstr())
+
+            return tuple(map(named, section_headers))
+
+    @dataclass(frozen=True)
+    class SectionHeader:
+        name: int
+        type: int
+        flags: int
+        addr: int
+        offset: int
+        size: int
+        link: int
+        info: int
+        align: int
+        entsize: int
+
+        @classmethod
+        def read(cls, cursor: "ELF.Cursor"):
+            return cls(
+                name=cursor.readword(),
+                type=cursor.readword(),
+                flags=cursor.readoffset(),
+                addr=cursor.readoffset(),
+                offset=cursor.readoffset(),
+                size=cursor.readoffset(),
+                link=cursor.readword(),
+                info=cursor.readword(),
+                align=cursor.readoffset(),
+                entsize=cursor.readoffset(),
+            )
+
+        def symtab(self, cursor: "ELF.Cursor", shtab: Table["ELF.SectionHeader"]):
+            if self.type != 2:  # SHT_SYMTAB = 2
+                return None
+            if self.entsize == 0:
+                return None
+            cursor.seek(self.offset)
+            symbols = tuple(
+                ELF.Symbol.read(cursor) for _ in range(0, self.size, self.entsize)
+            )
+            strtab = shtab[self.link].entry
+
+            def named(sym: ELF.Symbol):
+                cursor.seek(strtab.offset + sym.name)
+                return Named(sym, cursor.readstr())
+
+            return tuple(map(named, symbols))
+
+    @dataclass(frozen=True)
+    class Symbol:
+        name: int
+        value: int
+        size: int
+        info: int
+        other: int
+        section_idx: int
+
+        @classmethod
+        def read32(cls, cursor: "ELF.Cursor"):
+            assert cursor.addrsize == 4
+            return cls(
+                name=cursor.readword(),
+                value=cursor.readword(),
+                size=cursor.readoffset(),
+                info=cursor.readint(1),
+                other=cursor.readint(1),
+                section_idx=cursor.readhalfword(),
+            )
+
+        @classmethod
+        def read64(cls, cursor: "ELF.Cursor"):
+            assert cursor.addrsize == 8
+            return cls(
+                name=cursor.readword(),
+                info=cursor.readint(1),
+                other=cursor.readint(1),
+                section_idx=cursor.readhalfword(),
+                value=cursor.readoffset(),
+                size=cursor.readoffset(),
+            )
+
+        @classmethod
+        def read(cls, cursor: "ELF.Cursor"):
+            match cursor.addrsize:
+                case 4:
+                    return cls.read32(cursor)
+                case 8:
+                    return cls.read64(cursor)
+                case _:
+                    raise InvalidObjFile
+
+        @property
+        def st_type(self):
+            return self.info >> 4
+
+        @property
+        def st_bind(self):
+            return self.info & 0x0F
+
+        def content(self, cursor: "ELF.Cursor", shtab: Table["ELF.SectionHeader"]):
+            if self.st_type != 1:  # STT_OBJECT = 1
+                return None
+
+            section = shtab[self.section_idx].entry
+            cursor.seek(section.offset + self.value)
+            return cursor.read(self.size)
+
+        @dataclass(frozen=True)
+        class Table:
+            entry: tuple["ELF.Symbol.Table.Entry", ...]
+
+            def __iter__(self):
+                return iter(self.entry)
+
+            @dataclass(frozen=True)
+            class Entry:
+                symbol: "ELF.Symbol"
+                name: bytes
+
+                @classmethod
+                def read(
+                    cls,
+                    cursor: "ELF.Cursor",
+                    symbol: "ELF.Symbol",
+                    strtab: "ELF.SectionHeader",
+                ):
+                    cursor.seek(strtab.offset + symbol.name)
+                    return cls(symbol, cursor.readstr())
+
+    def __init__(self, bin: T.IO[bytes]):
+        try:
+            bin.seek(0)
+        except io.UnsupportedOperation:
+            bin = io.BytesIO(bin.read())
+
+        self.cursor = ELF.Cursor(bin)
+        self.header = ELF.Header.read(self.cursor)
+
+
+def read_output(ld_cfg: Config, bin: T.IO[bytes]):
+    LD_LOG_WIDTH = "LD_LOG_WIDTH"
+    log_width = 24
+    log_min_width = 24
+    try:
+        log_width = int(os.environ.get(LD_LOG_WIDTH, log_width))
+    except ValueError:
+        ld_cfg.log(
+            f"Invalid integer value for {LD_LOG_WIDTH}", os.environ.get(LD_LOG_WIDTH)
+        )
+
+    def log_kv(key: object, value: object, *, depth: int = 0):
+        nonlocal log_width, log_min_width
+        PAD = "[...]"
+        kstr = str(key)
+
+        tab = depth * 2
+        max_width = max(log_width - tab, 0)
+        width = max_width or max(log_min_width - tab, 0)
+        lhs = (
+            f"{kstr}:"
+            if max_width <= 0 or len(kstr) <= max_width
+            else (
+                f"{kstr[:max_width-len(PAD)]}{PAD}"
+                if max_width > len(PAD)
+                else f"{kstr[:max_width - 1]}~"
+            )
+        )
+        ld_cfg.log(f"{' '*tab}{lhs:{width}}  {value}")
+
+    elf = ELF(bin)
+    ld_cfg.log("~~~~~")
+    log_kv("ELF object file", bin.name)
+    log_kv(
+        "Address size",
+        str("??" if elf.cursor.addrsize is None else elf.cursor.addrsize * 8) + "-bit",
+    )
+    log_kv("Endianness", elf.cursor.byteorder)
+
+    shtab = elf.header.section_headers(elf.cursor)
+    log_kv("Section headers", len(shtab))
+    log_kv("SH string table", f"{shtab[elf.header.strtabidx]} [{elf.header.strtabidx}]")
+
+    for idx, sh in enumerate(shtab):
+        symtab = sh.entry.symtab(elf.cursor, shtab)
+        if symtab is None:
+            continue
+        log_kv("Symbol table", f"{sh} [{idx}]")
+        for sym in symtab:
+
+            symname = str(sym)
+            if ld_cfg.verbose and ld_cfg.cxxfilt:
+                filt = subprocess.run(
+                    (ld_cfg.cxxfilt, symname), stdout=subprocess.PIPE, text=True
+                )
+                if filt.returncode == 0:
+                    symname = filt.stdout.strip()
+
+            if content := sym.entry.content(elf.cursor, shtab):
+                bytestr = " ".join(map(lambda b: f"{b:02x}", content[:32]))
+                if len(content) > 32:
+                    bytestr += " ..."
+
+                if not ld_cfg.verbose and sym.name == ld_cfg.run:
+                    if ld_cfg.print_bytes:
+                        with open(ld_cfg.out, "a") as out:
+                            out.write(f"{bin.name}: {content!r}\n")
+                    else:
+                        with open(ld_cfg.out, "ab") as out:
+                            out.write(content)
+                bytestr = f"[{bytestr}]"
+            else:
+                bytestr = None
+
+            log_kv(symname, bytestr, depth=1)
+
+
+if __name__ == "__main__":
+    ld_cfg = Config.from_args(sys.argv)
+    ld_cfg.log("cmd:", *sys.argv)
+    ld_cfg.log("output symbol:", ld_cfg.run)
+
+    # clear file contents
+    open(ld_cfg.out, "w").close()
+
+    for file in ld_cfg.files:
+        with open(file, "rb") as bin:
+            try:
+                read_output(ld_cfg, bin)
+            except InvalidObjFile:
+                ld_cfg.log("skipping file:", file)

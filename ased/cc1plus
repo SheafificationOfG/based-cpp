@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+This abstract system emulator driver is responsible for
+sending terminal console input to the C++ program standard
+input strean.
+"""
+
+from dataclasses import dataclass
+import re
+import subprocess
+import sys
+import typing
+
+
+def find_cc1plus(gcc):
+    cmd = (gcc, "-xc++", "-E", "-", "-wrapper", "echo")
+
+    mime = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+
+    return mime.stdout.split()[0]
+
+
+def yesify(s: str):
+    return s.strip().lower() in ("1", "yes", "true", "indeed")
+
+
+def run_cc1plus(cmd: tuple[str, ...], debug: int):
+    if not debug:
+        return subprocess.call(cmd)
+
+    run = subprocess.run(
+        (*cmd, "-D", f"DEBUG={debug}"), stderr=subprocess.PIPE, text=True
+    )
+    if run.returncode == 0:
+        print("cc1plus failed unsuccessfully", file=sys.stderr)
+        return 101
+
+    note_pat = re.compile(
+        r"(?P<file>.*?):(?P<row>\d+):(?P<col>\d+): (?P<severity>\w+): (?P<what>.*?) ‘(?P<line>.*?)’"
+    )
+    aka_pat = re.compile(r"\s*\{aka ‘(?P<aka>.*?)’\}")
+    debug_pat = re.compile(
+        r"struct gil::detail::runtime::_impl_::Debug<(?P<content>.*)>"
+    )
+    last_note = None
+    last_aka = None
+    for line in run.stderr.splitlines():
+        note = note_pat.match(line)
+        if note is None:
+            continue
+        last_note = note
+        last_aka = aka_pat.match(line, note.end())
+        if note["severity"] == "error":
+            break
+
+    if last_note is None:
+        sys.stderr.write(run.stderr)
+        return 202
+
+    if debug_struct := debug_pat.match(last_note["line"]):
+        dump_struct(debug_struct["content"])
+        return
+
+    print(
+        "{what!r} {severity} at {file}:{row}:{col}:".format(
+            what=last_note["what"].title(),
+            severity=last_note["severity"],
+            file=last_note["file"],
+            row=last_note["row"],
+            col=last_note["col"],
+        )
+    )
+    dump_struct(last_note["line"])
+    if last_aka is not None:
+        print("~~~ aka ~~~")
+        dump_struct(last_aka["aka"])
+
+    return run.returncode
+
+
+def dump_struct(s: str, *, bufsize: int = 1):
+    CHUNK = re.compile(r"[^<>(){}'\",]*")
+    STRING = {
+        '"': re.compile(r"[^\"\\]*"),
+        "'": re.compile(r"[^'\\]*"),
+    }
+    depth = 0
+    buf = ""
+    index = 0
+
+    def take():
+        nonlocal s, index
+        if index < len(s):
+            c = s[index]
+            index += 1
+            return c
+        return ""
+
+    def read_str(delim: typing.Literal['"', "'"]):
+        nonlocal STRING, s, index
+        tot = ""
+        while True:
+            chunk = STRING[delim].match(s, index)
+            if chunk is None:
+                break
+            tot += chunk[0]
+            index = chunk.end()
+
+            ch = take()
+            tot += ch
+            if ch == delim:
+                break
+            if ch == "\\":
+                tot += take()
+
+        return tot
+
+    def read_chunk():
+        nonlocal CHUNK, s, index
+        tot = ""
+        while index < len(s):
+            chunk = CHUNK.match(s, index)
+            if chunk is None:
+                break
+            tot += chunk[0]
+            index = chunk.end()
+
+            ch = take()
+            tot += ch
+
+            if ch == ",":
+                yield tot, 0
+                tot = ""
+                continue
+            if ch in ("<", "(", "{", "["):
+                yield tot, 1
+                tot = ""
+                continue
+            if ch in (">", ")", "}", "]"):
+                yield tot[:-1], None
+                yield tot[-1], -1
+                tot = ""
+                continue
+            if ch in ("'", '"'):
+                tot += read_str(ch)
+                continue
+
+        yield tot, None
+
+    def combine_chunk(chunk: str, act: typing.Literal[1, 0, -1] | None):
+        nonlocal buf, bufsize, depth
+        match act:
+            case None:
+                buf += chunk
+            case 0:
+                yield depth, buf + chunk
+                buf = ""
+            case 1:
+                yield depth, buf + chunk
+                depth += 1
+                buf = ""
+            case -1:
+                yield depth, buf
+                depth -= 1
+                buf = chunk
+
+    if sys.stdout.isatty() and (
+        sys.platform != "win32" or yesify(os.environ.get("ANSICON", "0"))
+    ):
+
+        def print_chunk(depth: int, line: str):
+            line = line.strip()
+            col = (depth % 7) + 1
+            bold = "1;" if (depth // 7) & 1 == 0 else ""
+            dim = "2;" if (depth // 14) & 1 else ""
+            print(f"\x1b[{bold}{dim}3{col}m{line}\x1b[m", end=" ")
+
+    elif yesify(os.environ.get("CC1PLUS_DEBUG_ONELINE", "0")):
+
+        def print_chunk(depth: int, line: str):
+            print(line.strip(), end=" ")
+
+    else:
+
+        def print_chunk(depth: int, line: str):
+            line = line.strip()
+            if line:
+                print("  " * depth + line)
+
+    for chunk, act in read_chunk():
+        for pad, line in combine_chunk(chunk, act):
+            print_chunk(pad, line)
+    print_chunk(depth, buf)
+    print()
+
+
+if __name__ == "__main__":
+    from json import dumps
+    import os
+    import shutil
+
+    verbose = yesify(os.environ.get("CC1PLUS_VERBOSE", "0"))
+    try:
+        debug = int(os.environ.get("CC1PLUS_DEBUG", "0"))
+    except ValueError:
+        print(f"Error: CC1PLUS_DEBUG expects an integer.", file=sys.stderr)
+        exit(1)
+
+    try:
+        cc1plus = os.environ.get("CC1PLUS")
+
+        if cc1plus is None:
+            gcc = os.environ.get("GCC") or shutil.which("g++") or "g++"
+            if verbose:
+                print(f"GCC={gcc}", file=sys.stderr)
+
+            cc1plus = find_cc1plus(gcc)
+
+        if verbose:
+            print(f"CC1PLUS={cc1plus}", file=sys.stderr)
+
+        args = sys.argv[1:]
+        stdin = dumps(sys.stdin.read())
+
+        cmd = (cc1plus, *args, "-D", f"__STDIN__={stdin}")
+        if verbose:
+            print(" ".join(map(dumps, cmd)))
+        exit(run_cc1plus(cmd, debug))
+
+    except Exception as exc:
+        print(f"cc1plus failed: {exc}", file=sys.stderr)
+        exit(1)
+    except KeyboardInterrupt:
+        exit(1)
