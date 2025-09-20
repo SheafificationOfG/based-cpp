@@ -1,4 +1,4 @@
-//usr/bin/env g++ -Based -std=c++23 -o - "$0" -DLANGUAGE="$1" "${@:2}"; exit
+//usr/bin/env g++ -Based -std=c++23 -O2 -o - "$0" -DLANGUAGE="$1" "${@:2}"; exit
 
 #include "gil/std.hpp"
 using namespace gil::std;
