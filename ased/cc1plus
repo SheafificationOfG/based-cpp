@@ -2,7 +2,7 @@
 """
 This abstract system emulator driver is responsible for
 sending terminal console input to the C++ program standard
-input strean.
+input stream.
 """
 
 from dataclasses import dataclass
