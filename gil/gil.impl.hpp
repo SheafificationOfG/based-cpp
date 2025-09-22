@@ -2,7 +2,7 @@
  * GNU Interface Layer - Implementation
  *
  * This header implements the C++ abstract machine and the behaviour
- * of its insrtuction set.
+ * of its instruction set.
  */
 
 #ifndef GIL_IMPL_HPP_
