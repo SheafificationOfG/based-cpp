@@ -25,8 +25,17 @@ To run the program, run
 g++ -std=c++23 -Based hello_world.cpp -o -
 ```
 
+Note that the program won't execute until all `stdin` is read, which means you need to pass it an `EOF` (e.g., `^D` from `stdin`).
+
 > [!NOTE]
-> The above command only works if you invoke `g++` from the root of this repo; otherwise, you will have to provide the full path to the required abstract system emulator drivers (`ased`) folder.
+> Use `-O2` or `-O3` if you want things to run faster.
+> (I didn't do this in my video... oops).
+
+### System
+
+I've only tested this thing on my machines (Ubuntu 22.04 / 24.04) using `g++ 14.2.0`.
+If it doesn't work on your machine, maybe that's actually a good thing.
+> See also [#8](https://github.com/SheafificationOfG/based-cpp/issues/8).
 
 ## Examples
 
@@ -38,5 +47,3 @@ g++ -std=c++23 -Based hello_world.cpp -o -
   > Perform a single binary operation on a pair of 64-bit signed integers.
 - `mergesort.cpp`
   > Merge sort a comma-separated list of 64-bit signed integers.
-
-
