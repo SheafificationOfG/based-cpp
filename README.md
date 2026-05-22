@@ -2,7 +2,7 @@
 
 This repo provides an implementation of the GNU Interface Layer (GIL) and standard library for `g++`.
 
-### C++ is the best interpreted language
+[**C++ is the best interpreted language**](https://youtu.be/cFtymODJEjs)
 
 [![C++ is the best interpreted language!](https://img.youtube.com/vi/cFtymODJEjs/0.jpg)](https://youtu.be/cFtymODJEjs)
 
